@@ -8,18 +8,23 @@ for extracurricular activities at Mergington High School.
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
-import os
 from pathlib import Path
+import os
+import json
+
+from sqlmodel import Session, select
+
+from .db import init_db, engine
+from .models import Activity
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
-app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
-          "static")), name="static")
+app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent, "static")), name="static")
 
-# In-memory activity database
+# In-memory activity database - used only to bootstrap the DB on first run
 activities = {
     "Chess Club": {
         "description": "Learn strategies and compete in chess tournaments",
@@ -77,6 +82,23 @@ activities = {
     }
 }
 
+# Initialize DB and ensure activities are present
+init_db()
+with Session(engine) as session:
+    for name, data in activities.items():
+        stmt = select(Activity).where(Activity.name == name)
+        existing = session.exec(stmt).first()
+        if not existing:
+            a = Activity(
+                name=name,
+                description=data.get("description", ""),
+                schedule=data.get("schedule", ""),
+                max_participants=data.get("max_participants", 0),
+                participants=json.dumps(data.get("participants", []))
+            )
+            session.add(a)
+    session.commit()
+
 
 @app.get("/")
 def root():
@@ -85,48 +107,57 @@ def root():
 
 @app.get("/activities")
 def get_activities():
-    return activities
+    """Return all activities from the database as a dict"""
+    result = {}
+    with Session(engine) as session:
+        activities_db = session.exec(select(Activity)).all()
+        for a in activities_db:
+            result[a.name] = {
+                "description": a.description,
+                "schedule": a.schedule,
+                "max_participants": a.max_participants,
+                "participants": json.loads(a.participants or "[]")
+            }
+    return result
 
 
 @app.post("/activities/{activity_name}/signup")
 def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
-    # Validate activity exists
-    if activity_name not in activities:
-        raise HTTPException(status_code=404, detail="Activity not found")
+    """Sign up a student for an activity (persisted)"""
+    with Session(engine) as session:
+        stmt = select(Activity).where(Activity.name == activity_name)
+        activity = session.exec(stmt).first()
+        if not activity:
+            raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
-    activity = activities[activity_name]
+        participants = json.loads(activity.participants or "[]")
+        if email in participants:
+            raise HTTPException(status_code=400, detail="Student is already signed up")
 
-    # Validate student is not already signed up
-    if email in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is already signed up"
-        )
+        participants.append(email)
+        activity.participants = json.dumps(participants)
+        session.add(activity)
+        session.commit()
 
-    # Add student
-    activity["participants"].append(email)
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
 @app.delete("/activities/{activity_name}/unregister")
 def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
-    # Validate activity exists
-    if activity_name not in activities:
-        raise HTTPException(status_code=404, detail="Activity not found")
+    """Unregister a student from an activity (persisted)"""
+    with Session(engine) as session:
+        stmt = select(Activity).where(Activity.name == activity_name)
+        activity = session.exec(stmt).first()
+        if not activity:
+            raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Get the specific activity
-    activity = activities[activity_name]
+        participants = json.loads(activity.participants or "[]")
+        if email not in participants:
+            raise HTTPException(status_code=400, detail="Student is not signed up for this activity")
 
-    # Validate student is signed up
-    if email not in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is not signed up for this activity"
-        )
+        participants.remove(email)
+        activity.participants = json.dumps(participants)
+        session.add(activity)
+        session.commit()
 
-    # Remove student
-    activity["participants"].remove(email)
     return {"message": f"Unregistered {email} from {activity_name}"}
